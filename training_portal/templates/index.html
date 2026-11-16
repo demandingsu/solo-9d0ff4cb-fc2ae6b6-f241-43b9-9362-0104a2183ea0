@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>访谈语料训练分发平台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="masthead">
+    <div class="wrap">
+      <h1>访谈语料训练分发平台</h1>
+      <p class="sub">上传访谈 CSV · 后台生成训练集 · 撤回授权即时生效</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    {% if error %}<div class="flash flash-error">{{ error }}</div>{% endif %}
+    {% if notice %}<div class="flash flash-ok">{{ notice }}</div>{% endif %}
+
+    <section class="statrow">
+      <div class="stat"><span class="num">{{ stats.batches }}</span><span>批次</span></div>
+      <div class="stat"><span class="num">{{ stats.utterances }}</span><span>语料行</span></div>
+      <div class="stat"><span class="num">{{ stats.revocations }}</span><span>已撤回编号</span></div>
+      <div class="stat {% if stats.pending %}stat-danger{% endif %}">
+        <span class="num">{{ stats.pending }}</span><span>待清理文件</span>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>1. 上传访谈语料</h2>
+        <p class="hint">CSV 需包含列：<code>batch</code>（访谈批次）、<code>respondent_id</code>（受访者编号）、<code>text</code>（文本）。也接受中文表头：访谈批次 / 受访者编号 / 文本。</p>
+        <form method="post" action="/upload" enctype="multipart/form-data" class="stack">
+          <input type="file" name="file" accept=".csv,text/csv">
+          <div class="row">
+            <button type="submit" class="btn">上传并导入</button>
+          </div>
+        </form>
+        {% if samples %}
+        <div class="samples">
+          <span class="hint">本地样例：</span>
+          {% for name in samples %}
+          <form method="post" action="/upload" class="inline">
+            <input type="hidden" name="sample" value="{{ name }}">
+            <button type="submit" class="btn btn-ghost">{{ name }}</button>
+          </form>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </section>
+
+      <section class="card">
+        <h2>2. 选择批次并生成训练 CSV</h2>
+        {% if batches %}
+        <form method="post" action="/generate" class="row">
+          <select name="batch" required>
+            {% for b in batches %}
+            <option value="{{ b.name }}" {% if not b.rows %}disabled{% endif %}>
+              {{ b.name }}（{{ b.rows }} 行 / {{ b.people }} 人）{% if not b.rows %} — 无可用语料{% endif %}
+            </option>
+            {% endfor %}
+          </select>
+          <button type="submit" class="btn">后台生成</button>
+        </form>
+        {% else %}
+        <p class="hint">尚无可选批次，请先上传 CSV。</p>
+        {% endif %}
+      </section>
+
+      <section class="card">
+        <h2>3. 撤回受访者授权</h2>
+        <p class="hint">撤回立即持久生效：删除该编号的全部语料行，锁定并清理所有包含其文本的导出文件；之后上传同号（或其原文）都不会重新纳入。</p>
+        <form method="post" action="/revoke" class="row">
+          <input type="text" name="respondent_id" placeholder="受访者编号，例如 R-1001" required>
+          <button type="submit" class="btn btn-danger">撤回授权</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>演示设置</h2>
+        <form method="post" action="/settings" class="stack">
+          <label class="check">
+            <input type="checkbox" name="pause_generation" value="1" {% if settings.pause_generation %}checked{% endif %}>
+            生成暂停（文件写好但停在发布前，可在此窗口撤回）
+          </label>
+          <label class="check">
+            <input type="checkbox" name="delete_always_fail" value="1" {% if settings.delete_always_fail %}checked{% endif %}>
+            删除持续失败（文件保持待清理，重启后继续清理且不可下载）
+          </label>
+          <label class="field">
+            <span>删除失败次数（下次删除前消耗）：</span>
+            <input type="number" name="delete_failures_remaining" min="0" max="50" value="{{ settings.delete_failures_remaining }}">
+          </label>
+          <div class="row">
+            <button type="submit" class="btn btn-ghost">保存设置</button>
+          </div>
+        </form>
+        {% if pending %}
+        <form method="post" action="/cleanup/retry" class="row retry">
+          <span class="hint">有 {{ pending }} 个文件待清理。</span>
+          <button type="submit" class="btn btn-ghost">立即重试清理</button>
+        </form>
+        {% endif %}
+        <p class="hint small">开关与失败预算保存在 SQLite 中，重启后仍生效；只有关闭开关或点「立即重试清理」才会继续删除。</p>
+      </section>
+    </div>
+
+    <section class="card wide">
+      <h2>生成任务</h2>
+      <p class="hint small">正在生成的任务会在此刷新状态；「演示暂停」时文件已写好但尚未发布，此时撤回会将其标记为「已阻止」。</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>任务</th><th>批次</th><th>状态</th><th>进度</th><th>说明</th><th>申请时间</th></tr>
+          </thead>
+          <tbody>
+            {% for j in jobs %}
+            <tr data-job="{{ j.id }}">
+              <td>#{{ j.id }}</td>
+              <td>{{ j.batch }}</td>
+              <td><span class="pill pill-{{ j.status }}" data-job-status>{{ j.status | status_label }}</span></td>
+              <td data-job-progress>{{ j.written_rows }} / {{ j.total_rows }}</td>
+              <td class="msg" data-job-message>{{ j.message or "" }}</td>
+              <td class="mono">{{ j.requested_at | short_time }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="empty">暂无生成任务</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>导出文件</h2>
+      <p class="hint small">「可下载」的后端会再次校验授权；「待清理」表示文件已禁止下载、正等待删除，重启后清理继续。</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>文件</th><th>批次</th><th>行数</th><th>状态</th><th>撤回 / 清理原因</th><th>删除尝试</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for e in exports %}
+            <tr data-export="{{ e.id }}">
+              <td class="mono">{{ e.download_name }}</td>
+              <td>{{ e.batch }}</td>
+              <td>{{ e.row_count }}</td>
+              <td><span class="pill pill-{{ e.status }}" data-export-status>{{ e.status | status_label }}</span></td>
+              <td class="msg" data-export-reason>{{ e.purge_reason or e.last_delete_error or "" }}</td>
+              <td data-export-attempts>{{ e.delete_attempts }}</td>
+              <td data-export-action>
+                {% if e.status == 'ready' %}
+                <a class="btn btn-small" href="/download/{{ e.id }}">下载</a>
+                {% else %}
+                <span class="hint small">不可下载</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="empty">暂无导出文件</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>已撤回编号</h2>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>编号</th><th>撤回时间</th><th>删除语料</th><th>锁定文件</th></tr></thead>
+            <tbody>
+              {% for r in revocations %}
+              <tr>
+                <td class="mono">{{ r.respondent_id }}</td>
+                <td class="mono">{{ r.revoked_at | short_time }}</td>
+                <td>{{ r.deleted_rows }} 行</td>
+                <td>{{ r.affected_exports }} 个</td>
+              </tr>
+              {% else %}
+              <tr><td colspan="4" class="empty">暂无撤回记录</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>上传记录</h2>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>文件</th><th>读取</th><th>导入</th><th>跳过撤回</th><th>无效</th></tr></thead>
+            <tbody>
+              {% for u in uploads %}
+              <tr>
+                <td class="mono">{{ u.filename }}</td>
+                <td>{{ u.total_rows }}</td>
+                <td>{{ u.accepted_rows }}</td>
+                <td>{{ u.skipped_revoked }}</td>
+                <td>{{ u.skipped_invalid }}</td>
+              </tr>
+              {% else %}
+              <tr><td colspan="5" class="empty">暂无上传记录</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <section class="notes">
+      <h2>行为说明</h2>
+      <ul>
+        <li><strong>撤回先持久化：</strong>撤回记录、语料行删除、导出锁定与任务中止在同一个 SQLite 写事务中提交，任何读取路径都不会看到「已撤回但仍可导出」的中间态。</li>
+        <li><strong>重新上传不复活：</strong>上传时按受访者编号过滤，已撤回行计入「跳过撤回」。撤回后再次上传同号不会重新纳入。</li>
+        <li><strong>生成中撤回：</strong>生成按 20 行一个分块，每块前重读撤回表；批次内任一编号被撤回即中止整个任务（其文本与其他语料交错，只删其行仍会泄漏），结果不发布。</li>
+        <li><strong>发布前闸门：</strong>临时文件先改名为正式文件，随后在同一事务中复核撤回并写入导出记录；若撤回已发生，文件立即删除，任务标记「已阻止」。</li>
+        <li><strong>下载时校验：</strong>每次下载都在写事务中比对撤回表与导出所含编号，命中即锁定该文件、返回拒绝并触发清理。</li>
+        <li><strong>删除失败 → 待清理：</strong>删除失败留下 <code>pending_delete</code> 记录（累计尝试次数与错误信息），该状态永不可下载；后台清理器与启动扫描持续重试。被删除前的残留临时文件与无主文件在启动时一并清除。</li>
+      </ul>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

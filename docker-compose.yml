@@ -1,0 +1,19 @@
+services:
+  portal:
+    build: .
+    container_name: interview-portal
+    ports:
+      - "8000:8000"
+    environment:
+      PORTAL_DATA_DIR: /data
+      # Demo switches. These seed the SQLite settings row on first boot only;
+      # changes made in the UI survive restarts (which the cleanup demo needs).
+      PORTAL_PAUSE_GENERATION: "0"
+      PORTAL_DELETE_FAILURES: "0"
+      PORTAL_DELETE_ALWAYS_FAIL: "0"
+    volumes:
+      - portal-data:/data
+    restart: unless-stopped
+
+volumes:
+  portal-data:
