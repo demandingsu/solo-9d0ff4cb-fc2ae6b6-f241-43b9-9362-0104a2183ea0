@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>核对报告 #{{ report.id }} · {{ report.batch }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="masthead">
+    <div class="wrap">
+      <h1>双审核员标注核对报告 #{{ report.id }}</h1>
+      <p class="sub">批次 {{ report.batch }} · 依据语料状态版本 v{{ report.batch_version }} · 生成于 {{ report.created_at | short_time }}</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <a class="btn btn-ghost back-link" href="/">← 返回平台首页</a>
+
+    {% if report.status == 'current' %}
+    <div class="qc-banner qc-banner-current">
+      <strong>当前报告</strong>
+      <span class="reason">指标与明细均来自同一次已提交的语料状态（v{{ report.batch_version }}）。</span>
+    </div>
+    {% else %}
+    <div class="qc-banner qc-banner-stale">
+      <strong>已过期，指标失效，不可作为当前结论</strong>
+      <span class="reason">{{ report.stale_reason or '该批次语料状态已变化' }}
+        {% if current_version is not none %}（当前版本 v{{ current_version }}，本报告基于 v{{ report.batch_version }}）{% endif %}
+      </span>
+    </div>
+    {% endif %}
+
+    <section class="card wide">
+      <h2>核对概览</h2>
+      <p class="hint small">
+        审核员 A：<code>{{ report.file_a_name }}</code> ｜ 审核员 B：<code>{{ report.file_b_name }}</code>
+      </p>
+      <div class="qc-kpis">
+        <div class="qc-kpi"><span class="k">授权行总数</span><span class="v">{{ report.authorized_rows }}</span></div>
+        <div class="qc-kpi"><span class="k">A 已标注 / 缺标</span><span class="v">{{ report.labeled_a }} / {{ report.missing_a }}</span></div>
+        <div class="qc-kpi"><span class="k">B 已标注 / 缺标</span><span class="v">{{ report.labeled_b }} / {{ report.missing_b }}</span></div>
+        <div class="qc-kpi"><span class="k">共同标注行</span><span class="v">{{ report.common_labeled }}</span></div>
+        <div class="qc-kpi"><span class="k">一致 / 分歧</span><span class="v">{{ report.agreements }} / {{ report.disagreements }}</span></div>
+        <div class="qc-kpi">
+          <span class="k">Cohen's κ（共同标注部分）</span>
+          {% if report.kappa is not none %}
+          <span class="v">{{ '%.4f'|format(report.kappa) }}</span>
+          {% else %}
+          <span class="v small kappa-undefined">无法定义</span>
+          {% endif %}
+        </div>
+      </div>
+      {% if report.kappa_note %}
+      <p class="kappa-undefined">κ 说明：{{ report.kappa_note }}</p>
+      {% endif %}
+
+      <h2>三类交叉计数（行：审核员 A，列：审核员 B；仅共同标注行）</h2>
+      <div class="tablewrap">
+        <table class="matrix">
+          <thead>
+            <tr>
+              <th class="rowhead">A ＼ B</th>
+              {% for b in ['usable', 'review', 'discard'] %}
+              <th class="colhead">{{ label_cn[b] }}</th>
+              {% endfor %}
+              <th class="colhead">A 合计</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for a in ['usable', 'review', 'discard'] %}
+            <tr>
+              <th class="rowhead">{{ label_cn[a] }}</th>
+              {% for b in ['usable', 'review', 'discard'] %}
+              <td class="{% if a == b %}diag{% elif matrix[a][b] %}off{% endif %}">{{ matrix[a][b] }}</td>
+              {% endfor %}
+              <td class="mono">{{ matrix[a]['usable'] + matrix[a]['review'] + matrix[a]['discard'] }}</td>
+            </tr>
+            {% endfor %}
+            <tr>
+              <th class="rowhead">B 合计</th>
+              {% for b in ['usable', 'review', 'discard'] %}
+              <td class="mono">{{ matrix['usable'][b] + matrix['review'][b] + matrix['discard'][b] }}</td>
+              {% endfor %}
+              <td class="mono">{{ report.common_labeled }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>缺标行（{{ missing | length }}）</h2>
+      <p class="hint small">按行号对齐后，至少一位审核员未标注的授权行。</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>行号</th><th>受访者</th><th>A 标签</th><th>B 标签</th><th>原文</th></tr>
+          </thead>
+          <tbody>
+            {% for item in missing %}
+            <tr>
+              <td class="mono">{{ item.utterance_id }}</td>
+              <td class="mono">{{ item.respondent_id or '—' }}</td>
+              <td>{% if item.label_a %}<span class="tag tag-{{ item.label_a }}">{{ item.label_a | qc_label }}</span>{% else %}<span class="tag tag-missing">缺标</span>{% endif %}</td>
+              <td>{% if item.label_b %}<span class="tag tag-{{ item.label_b }}">{{ item.label_b | qc_label }}</span>{% else %}<span class="tag tag-missing">缺标</span>{% endif %}</td>
+              <td>
+                {% if item.text_hidden %}
+                <span class="text-hidden">原文已随授权撤回隐藏（行号与指标保留）</span>
+                {% else %}
+                <span class="qc-text">{{ item.text }}</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">无缺标行</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>分歧行（{{ disagreements | length }}）</h2>
+      <p class="hint small">两位审核员对同一授权行给出不同标签的行，附原文供质检员裁决。</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>行号</th><th>受访者</th><th>A 标签</th><th>B 标签</th><th>原文</th></tr>
+          </thead>
+          <tbody>
+            {% for item in disagreements %}
+            <tr>
+              <td class="mono">{{ item.utterance_id }}</td>
+              <td class="mono">{{ item.respondent_id or '—' }}</td>
+              <td><span class="tag tag-{{ item.label_a }}">{{ item.label_a | qc_label }}</span></td>
+              <td><span class="tag tag-{{ item.label_b }}">{{ item.label_b | qc_label }}</span></td>
+              <td>
+                {% if item.text_hidden %}
+                <span class="text-hidden">原文已随授权撤回隐藏（行号与指标保留）</span>
+                {% else %}
+                <span class="qc-text">{{ item.text }}</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty">无分歧行</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

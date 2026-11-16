@@ -11,9 +11,64 @@ SCHEMA = """
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS batches (
-    name        TEXT PRIMARY KEY,
-    created_at  TEXT NOT NULL
+    name           TEXT PRIMARY KEY,
+    created_at     TEXT NOT NULL,
+    corpus_version INTEGER NOT NULL DEFAULT 0
 );
+
+-- Every change to the *currently authorized* rows of a batch (a new upload
+-- adding rows, or a revocation removing them) bumps corpus_version. A QC report
+-- stores the version it was computed against; any mismatch means the report can
+-- no longer be published as the current report.
+CREATE TABLE IF NOT EXISTS qc_reports (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch                TEXT NOT NULL,
+    batch_version        INTEGER NOT NULL,
+    status               TEXT NOT NULL CHECK (status IN ('current', 'stale')),
+    stale_reason         TEXT,
+    file_a_name          TEXT NOT NULL,
+    file_b_name          TEXT NOT NULL,
+    authorized_rows      INTEGER NOT NULL,
+    labeled_a            INTEGER NOT NULL,
+    labeled_b            INTEGER NOT NULL,
+    missing_a            INTEGER NOT NULL,
+    missing_b            INTEGER NOT NULL,
+    common_labeled       INTEGER NOT NULL,
+    agreements           INTEGER NOT NULL,
+    disagreements        INTEGER NOT NULL,
+    kappa                REAL,
+    kappa_note           TEXT,
+    created_at           TEXT NOT NULL,
+    stale_at             TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_qc_reports_batch ON qc_reports(batch);
+CREATE INDEX IF NOT EXISTS idx_qc_reports_status ON qc_reports(status);
+
+-- 3x3 cross-tab of the jointly labelled rows. Cells are keyed by the canonical
+-- labels usable / review / discard (row = reviewer A, column = reviewer B).
+CREATE TABLE IF NOT EXISTS qc_matrix_cells (
+    report_id    INTEGER NOT NULL REFERENCES qc_reports(id) ON DELETE CASCADE,
+    label_a      TEXT NOT NULL,
+    label_b      TEXT NOT NULL,
+    count        INTEGER NOT NULL,
+    PRIMARY KEY (report_id, label_a, label_b)
+);
+
+-- Per-line findings. The original text is deliberately NOT stored: it is joined
+-- from utterances at render time, so a revocation hides the text immediately.
+-- ``text_missing`` is set when the utterance itself no longer exists (withdrawn).
+CREATE TABLE IF NOT EXISTS qc_report_lines (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id     INTEGER NOT NULL REFERENCES qc_reports(id) ON DELETE CASCADE,
+    utterance_id  INTEGER NOT NULL,
+    label_a       TEXT,
+    label_b       TEXT,
+    kind          TEXT NOT NULL CHECK (kind IN ('missing', 'disagreement')),
+    created_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_qc_report_lines_report ON qc_report_lines(report_id);
 
 CREATE TABLE IF NOT EXISTS uploads (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,

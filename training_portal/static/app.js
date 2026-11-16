@@ -93,5 +93,22 @@
     ) {
       schedule(700);
     }
+
+    // Keep the "view authorized line numbers" link pointing at the batch
+    // selected in the QC form.
+    const qcForm = document.querySelector('form[action="/qc/reports"]');
+    if (qcForm) {
+      const select = qcForm.querySelector('select[name="batch"]');
+      const link = document.getElementById("qc-view-lines");
+      if (select && link) {
+        const sync = () => {
+          if (select.value) {
+            link.href = `/qc/lines?batch=${encodeURIComponent(select.value)}`;
+          }
+        };
+        select.addEventListener("change", sync);
+        sync();
+      }
+    }
   });
 })();

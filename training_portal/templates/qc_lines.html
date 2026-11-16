@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>授权行号 · {{ qc_batch }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="masthead">
+    <div class="wrap">
+      <h1>批次「{{ qc_batch }}」仍获授权的语料行号</h1>
+      <p class="sub">行号即语料库稳定行 ID；标注 CSV 请使用该行号。当前语料状态版本：v{{ qc_version }}（上传或撤回后版本递增，旧核对报告随之过期）</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <a class="btn btn-ghost back-link" href="/">← 返回平台首页</a>
+    <div class="card wide">
+      <div class="row" style="justify-content: space-between;">
+        <h2 style="margin:0;">共 {{ qc_lines | length }} 行</h2>
+        <a class="btn" href="/qc/lines.csv?batch={{ qc_batch | urlencode }}">下载行号 CSV（line_no, respondent_id, text）</a>
+      </div>
+      <p class="hint small" style="margin-top:10px;">下载内容含原文，仅用于分发给审核员标注；若期间发生撤回，请重新打开本页获取最新授权行。</p>
+      <div class="tablewrap line-preview">
+        <table>
+          <thead>
+            <tr><th>行号</th><th>受访者编号</th><th>原文</th></tr>
+          </thead>
+          <tbody>
+            {% for line in qc_lines %}
+            <tr>
+              <td class="mono">{{ line.id }}</td>
+              <td class="mono">{{ line.respondent_id }}</td>
+              <td class="qc-text">{{ line.text }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

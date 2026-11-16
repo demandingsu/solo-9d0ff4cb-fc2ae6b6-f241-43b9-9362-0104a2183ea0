@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from .db import Database, utc_now
+from .qc import (
+    CANONICAL_LABELS,
+    LABEL_CN,
+    compare,
+    parse_annotation_csv,
+)
 
 BATCH_COLUMN = "batch"
 RESPONDENT_COLUMN = "respondent_id"
@@ -254,9 +260,21 @@ class Portal:
 
             batches = sorted({row.batch for row in accepted})
             for batch in batches:
+                # A newly accepted row changes the authorized corpus of the
+                # batch: bump its version and retire any current QC report in
+                # the same transaction, so no report can stay "current" against
+                # a corpus state it was not computed from.
                 conn.execute(
-                    "INSERT OR IGNORE INTO batches(name, created_at) VALUES (?, ?)",
+                    "INSERT INTO batches(name, created_at, corpus_version) "
+                    "VALUES (?, ?, 1) ON CONFLICT(name) DO UPDATE SET "
+                    "corpus_version = batches.corpus_version + 1",
                     (batch, now),
+                )
+                conn.execute(
+                    "UPDATE qc_reports SET status = 'stale', stale_at = ?, "
+                    "stale_reason = '该批次有新的语料上传，报告依据的语料状态已改变' "
+                    "WHERE batch = ? AND status = 'current'",
+                    (now, batch),
                 )
             cursor = conn.execute(
                 "INSERT INTO uploads(filename, uploaded_at, total_rows, accepted_rows, "
@@ -379,6 +397,26 @@ class Portal:
                 "affected_batches = ? WHERE respondent_id = ?",
                 (deleted_rows, len(export_ids), blocked_jobs, respondent_id),
             )
+
+            # A revocation changes the authorized corpus of every batch the
+            # respondent belonged to. Bump those batches' versions and retire
+            # their current QC reports atomically with the row deletion, so the
+            # old metrics become invalid the instant the texts disappear.
+            for batch in batches:
+                conn.execute(
+                    "UPDATE batches SET corpus_version = corpus_version + 1 "
+                    "WHERE name = ?",
+                    (batch,),
+                )
+                conn.execute(
+                    "UPDATE qc_reports SET status = 'stale', stale_at = ?, "
+                    "stale_reason = ? WHERE batch = ? AND status = 'current'",
+                    (
+                        now,
+                        f"受访者 {respondent_id} 撤回授权，报告所含原文与指标已失效",
+                        batch,
+                    ),
+                )
 
         if export_ids:
             self.kick_cleanup()
@@ -985,6 +1023,221 @@ class Portal:
                 ).fetchone()["c"]
             )
 
+    # ------------------------------------------------------------------
+    # annotation QC (double review)
+    # ------------------------------------------------------------------
+    def batch_line_snapshot(self, batch: str) -> tuple[int, list[dict[str, Any]]]:
+        """Return ``(corpus_version, lines)`` for the batch's authorized rows.
+
+        Both values come from one read transaction, which is the single point at
+        which the QC computation fixes the corpus state it speaks about.
+        """
+        batch = batch.strip()
+        if not batch:
+            raise ValidationError("请选择批次")
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT corpus_version FROM batches WHERE name = ?", (batch,)
+            ).fetchone()
+            if row is None:
+                raise ValidationError("批次不存在，请先上传该批次语料")
+            version = int(row["corpus_version"])
+            lines = [
+                {"id": int(r["id"]), "respondent_id": r["respondent_id"], "text": r["text"]}
+                for r in conn.execute(
+                    "SELECT id, respondent_id, text FROM utterances "
+                    "WHERE batch = ? ORDER BY id",
+                    (batch,),
+                ).fetchall()
+            ]
+        return version, lines
+
+    def create_qc_report(
+        self,
+        batch: str,
+        file_a_name: str,
+        raw_a: bytes,
+        file_b_name: str,
+        raw_b: bytes,
+    ) -> dict[str, Any]:
+        """Parse both annotation files and publish one QC report.
+
+        The expensive parsing/alignment runs without a write lock so uploads and
+        revocations stay available on large batches. Publication takes a write
+        transaction and re-reads the batch version: if the corpus changed while
+        we were computing, the result is rolled back and the caller is told to
+        resubmit instead of being shown a report that never was current.
+        """
+        batch = batch.strip()
+        if not batch:
+            raise ValidationError("请选择批次")
+        if not raw_a or not raw_b:
+            raise ValidationError("请分别选择两位审核员的标注 CSV")
+
+        parsed_a = parse_annotation_csv(raw_a)
+        parsed_b = parse_annotation_csv(raw_b)
+
+        version, lines = self.batch_line_snapshot(batch)
+        if not lines:
+            raise ValidationError("该批次当前没有仍获授权的语料行，无法核对")
+        authorized_ids = [line["id"] for line in lines]
+        result = compare(authorized_ids, parsed_a.labels, parsed_b.labels)
+        if result["unknown"]:
+            parts = []
+            for reviewer, ids in result["unknown"].items():
+                preview = "、".join(str(n) for n in ids[:10])
+                extra = "……" if len(ids) > 10 else ""
+                parts.append(f"审核员 {reviewer} 含不属该批次的行号：{preview}{extra}")
+            raise ValidationError("；".join(parts) + "。请删除后重新上传")
+
+        now = utc_now()
+        # Test seam: lets the test suite mutate the batch mid-computation.
+        hook = getattr(self, "_qc_before_publish", None)
+        if callable(hook):
+            hook(batch)
+
+        with self.db.transaction() as conn:
+            current = conn.execute(
+                "SELECT corpus_version FROM batches WHERE name = ?", (batch,)
+            ).fetchone()
+            if current is None:
+                raise ValidationError("批次在核对期间被删除，请重新提交")
+            if int(current["corpus_version"]) != version:
+                # Never publish a result computed against a superseded state.
+                raise ValidationError(
+                    "核对期间该批次语料发生了变化（新上传或撤回），本次结果不作为当前报告发布，请重新提交核对"
+                )
+
+            cursor = conn.execute(
+                "INSERT INTO qc_reports(batch, batch_version, status, file_a_name, "
+                "file_b_name, authorized_rows, labeled_a, labeled_b, missing_a, "
+                "missing_b, common_labeled, agreements, disagreements, kappa, "
+                "kappa_note, created_at) VALUES (?, ?, 'current', ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch,
+                    version,
+                    Path(file_a_name).name,
+                    Path(file_b_name).name,
+                    len(authorized_ids),
+                    len(parsed_a.labels),
+                    len(parsed_b.labels),
+                    len(result["missing_a"]),
+                    len(result["missing_b"]),
+                    len(result["shared_lines"]),
+                    result["agreements"],
+                    result["disagreements"],
+                    result["kappa"],
+                    result["kappa_note"],
+                    now,
+                ),
+            )
+            report_id = int(cursor.lastrowid)
+            conn.executemany(
+                "INSERT INTO qc_matrix_cells(report_id, label_a, label_b, count) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (report_id, a, b, count)
+                    for a, row in result["matrix"].items()
+                    for b, count in row.items()
+                ],
+            )
+            line_rows: list[tuple[int, int, str | None, str | None, str, str]] = []
+            for line_no in result["missing_a"]:
+                line_rows.append(
+                    (report_id, line_no, parsed_a.labels.get(line_no),
+                     parsed_b.labels.get(line_no), "missing", now)
+                )
+            for line_no in result["missing_b"]:
+                line_rows.append(
+                    (report_id, line_no, parsed_a.labels.get(line_no),
+                     parsed_b.labels.get(line_no), "missing", now)
+                )
+            for line_no in result["disagreement_lines"]:
+                line_rows.append(
+                    (report_id, line_no, parsed_a.labels[line_no],
+                     parsed_b.labels[line_no], "disagreement", now)
+                )
+            conn.executemany(
+                "INSERT INTO qc_report_lines(report_id, utterance_id, label_a, "
+                "label_b, kind, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                line_rows,
+            )
+            # Only one current report per batch: older ones become stale.
+            conn.execute(
+                "UPDATE qc_reports SET status = 'stale', stale_at = ?, "
+                "stale_reason = '已被新的核对报告取代' "
+                "WHERE batch = ? AND status = 'current' AND id != ?",
+                (now, batch, report_id),
+            )
+        return {"report_id": report_id, "batch": batch, "version": version}
+
+    def qc_reports(self, limit: int = 30) -> list[dict[str, Any]]:
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM qc_reports ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def qc_report_detail(self, report_id: int) -> dict[str, Any] | None:
+        """Assemble one report, joining text lazily.
+
+        The text column is read from ``utterances`` at request time, never from
+        the report, so a withdrawn line immediately renders as hidden even
+        though the report row itself remains for the audit trail.
+        """
+        with self.db.read() as conn:
+            report = conn.execute(
+                "SELECT * FROM qc_reports WHERE id = ?", (report_id,)
+            ).fetchone()
+            if report is None:
+                return None
+            matrix_rows = conn.execute(
+                "SELECT * FROM qc_matrix_cells WHERE report_id = ? "
+                "ORDER BY label_a, label_b",
+                (report_id,),
+            ).fetchall()
+            detail_rows = conn.execute(
+                "SELECT ql.*, u.batch AS live_batch, u.respondent_id AS live_respondent, "
+                "u.text AS live_text FROM qc_report_lines ql "
+                "LEFT JOIN utterances u ON u.id = ql.utterance_id "
+                "WHERE ql.report_id = ? ORDER BY ql.kind, ql.utterance_id",
+                (report_id,),
+            ).fetchall()
+            current_version_row = conn.execute(
+                "SELECT corpus_version FROM batches WHERE name = ?",
+                (report["batch"],),
+            ).fetchone()
+
+        matrix = {a: {b: 0 for b in CANONICAL_LABELS} for a in CANONICAL_LABELS}
+        for row in matrix_rows:
+            matrix[row["label_a"]][row["label_b"]] = int(row["count"])
+
+        missing, disagreements = [], []
+        for row in detail_rows:
+            item = {
+                "utterance_id": int(row["utterance_id"]),
+                "label_a": row["label_a"],
+                "label_b": row["label_b"],
+                "respondent_id": row["live_respondent"],
+                "text": row["live_text"],
+                "text_hidden": row["live_text"] is None,
+            }
+            (disagreements if row["kind"] == "disagreement" else missing).append(item)
+
+        return {
+            "report": dict(report),
+            "matrix": matrix,
+            "missing": missing,
+            "disagreements": disagreements,
+            "current_version": (
+                int(current_version_row["corpus_version"])
+                if current_version_row is not None
+                else None
+            ),
+            "label_cn": LABEL_CN,
+        }
+
     def stats(self) -> dict[str, int]:
         with self.db.read() as conn:
             batches = int(
@@ -996,9 +1249,13 @@ class Portal:
             revocations = int(
                 conn.execute("SELECT COUNT(*) AS c FROM revocations").fetchone()["c"]
             )
+            qc_reports = int(
+                conn.execute("SELECT COUNT(*) AS c FROM qc_reports").fetchone()["c"]
+            )
         return {
             "batches": batches,
             "utterances": utterances,
             "revocations": revocations,
+            "qc_reports": qc_reports,
             "pending": self.pending_cleanup_count(),
         }

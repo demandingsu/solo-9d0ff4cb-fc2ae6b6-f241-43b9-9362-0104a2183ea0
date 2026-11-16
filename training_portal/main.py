@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,12 +12,14 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    RedirectResponse,
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .service import Portal, ValidationError
+from .qc import LABEL_CN, QCValidationError
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
@@ -43,6 +47,9 @@ templates.env.filters["status_label"] = (
 )
 templates.env.filters["short_time"] = lambda value: (
     (value or "").replace("T", " ")[:19] if value else ""
+)
+templates.env.filters["qc_label"] = (
+    lambda value: LABEL_CN.get(value, value or "缺标")
 )
 
 
@@ -97,6 +104,7 @@ def page(request: Request, **context: object):
         exports=portal.exports(),
         revocations=portal.revocations(),
         uploads=portal.uploads(),
+        qc_reports=portal.qc_reports(),
         **context,
     )
 
@@ -200,6 +208,79 @@ def cleanup_retry(request: Request):
         return page(request, notice=message + "。")
     except ValidationError as exc:
         return page(request, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# double-review QC
+# ---------------------------------------------------------------------------
+@app.get("/qc/lines")
+def qc_lines_page(request: Request, batch: str = ""):
+    try:
+        version, lines = portal.batch_line_snapshot(batch)
+    except ValidationError as exc:
+        return page(request, error=str(exc))
+    return render(
+        request,
+        "qc_lines.html",
+        qc_batch=batch,
+        qc_version=version,
+        qc_lines=lines,
+    )
+
+
+@app.get("/qc/lines.csv")
+def qc_lines_csv(batch: str = ""):
+    try:
+        _version, lines = portal.batch_line_snapshot(batch)
+    except ValidationError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(["line_no", "respondent_id", "text"])
+    for line in lines:
+        writer.writerow([line["id"], line["respondent_id"], line["text"]])
+    name = f"authorized-lines-{batch}.csv"
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": _attachment_header(name),
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+    )
+
+
+@app.post("/qc/reports")
+async def qc_create(
+    request: Request,
+    batch: str = Form(""),
+    file_a: UploadFile | None = None,
+    file_b: UploadFile | None = None,
+):
+    try:
+        if file_a is None or not file_a.filename or file_b is None or not file_b.filename:
+            raise ValidationError("请分别选择两位审核员的标注 CSV")
+        raw_a = await file_a.read(MAX_UPLOAD_BYTES + 1)
+        raw_b = await file_b.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw_a) > MAX_UPLOAD_BYTES or len(raw_b) > MAX_UPLOAD_BYTES:
+            raise ValidationError("标注文件超过 25MB 上限")
+        result = portal.create_qc_report(
+            batch, Path(file_a.filename).name, raw_a,
+            Path(file_b.filename).name, raw_b,
+        )
+        # POST-redirect-GET keeps the report page refresh-safe.
+        return RedirectResponse(url=f"/qc/reports/{result['report_id']}", status_code=303)
+    except (ValidationError, QCValidationError) as exc:
+        return page(request, error=str(exc))
+
+
+@app.get("/qc/reports/{report_id}")
+def qc_report_page(request: Request, report_id: int):
+    detail = portal.qc_report_detail(report_id)
+    if detail is None:
+        return page(request, error="核对报告不存在")
+    return render(request, "qc_report.html", **detail)
 
 
 @app.get("/download/{export_id}")

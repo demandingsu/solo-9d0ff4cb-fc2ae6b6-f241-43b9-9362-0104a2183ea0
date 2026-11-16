@@ -22,6 +22,7 @@
       <div class="stat"><span class="num">{{ stats.batches }}</span><span>批次</span></div>
       <div class="stat"><span class="num">{{ stats.utterances }}</span><span>语料行</span></div>
       <div class="stat"><span class="num">{{ stats.revocations }}</span><span>已撤回编号</span></div>
+      <div class="stat"><span class="num">{{ stats.qc_reports }}</span><span>核对报告</span></div>
       <div class="stat {% if stats.pending %}stat-danger{% endif %}">
         <span class="num">{{ stats.pending }}</span><span>待清理文件</span>
       </div>
@@ -76,6 +77,74 @@
           <button type="submit" class="btn btn-danger">撤回授权</button>
         </form>
       </section>
+    </div>
+
+    <section class="card wide">
+      <h2>4. 双审核员标注核对（Cohen κ）</h2>
+      <p class="hint small">先查看所选批次<strong>仍获授权</strong>的语料行号（可下载 CSV 分发给审核员），再上传两份含「行号 + 标签」的标注 CSV；标签允许 <code>可用 / 复核 / 剔除</code>（也接受英文 usable / review / discard）。重复行号、不属于该批次的行号、无法识别的标签都会报错。</p>
+      {% if batches %}
+      <form method="post" action="/qc/reports" enctype="multipart/form-data" class="stack">
+        <div class="row">
+          <select name="batch" required>
+            {% for b in batches %}
+            <option value="{{ b.name }}" {% if not b.rows %}disabled{% endif %}>
+              {{ b.name }}（{{ b.rows }} 行 / {{ b.people }} 人）{% if not b.rows %} — 无可用语料{% endif %}
+            </option>
+            {% endfor %}
+          </select>
+          <a class="btn btn-ghost" id="qc-view-lines" href="/qc/lines?batch={{ batches[0].name }}">查看该批授权行号</a>
+        </div>
+        <div class="grid-2">
+          <label class="field">
+            <span>审核员 A 的标注 CSV：</span>
+            <input type="file" name="file_a" accept=".csv,text/csv" required>
+          </label>
+          <label class="field">
+            <span>审核员 B 的标注 CSV：</span>
+            <input type="file" name="file_b" accept=".csv,text/csv" required>
+          </label>
+        </div>
+        <div class="row">
+          <button type="submit" class="btn">提交核对</button>
+          <span class="hint small">指标与明细取自同一次已提交的语料状态；核对期间批次发生上传或撤回，结果不会发布为当前报告。</span>
+        </div>
+      </form>
+      {% else %}
+      <p class="hint">尚无可选批次，请先上传语料 CSV。</p>
+      {% endif %}
+
+      <div class="tablewrap qc-table">
+        <table>
+          <thead>
+            <tr><th>报告</th><th>批次</th><th>状态</th><th>授权行</th><th>共同标注</th><th>一致 / 分歧</th><th>κ</th><th>文件（A / B）</th><th>生成时间</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for r in qc_reports %}
+            <tr>
+              <td>#{{ r.id }}</td>
+              <td>{{ r.batch }}</td>
+              <td>
+                {% if r.status == 'current' %}
+                <span class="pill pill-ready">当前</span>
+                {% else %}
+                <span class="pill pill-pending_delete" title="{{ r.stale_reason or '' }}">已过期</span>
+                {% endif %}
+              </td>
+              <td>{{ r.authorized_rows }}</td>
+              <td>{{ r.common_labeled }}</td>
+              <td>{{ r.agreements }} / {{ r.disagreements }}</td>
+              <td class="mono">{% if r.kappa is not none %}{{ '%.4f'|format(r.kappa) }}{% else %}<span class="hint small">无法定义</span>{% endif %}</td>
+              <td class="msg">{{ r.file_a_name }} / {{ r.file_b_name }}</td>
+              <td class="mono">{{ r.created_at | short_time }}</td>
+              <td><a class="btn btn-small" href="/qc/reports/{{ r.id }}">查看</a></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="10" class="empty">暂无核对报告</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
 
       <section class="card">
         <h2>演示设置</h2>
